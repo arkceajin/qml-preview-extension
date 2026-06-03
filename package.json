@@ -1,0 +1,87 @@
+{
+  "name": "qml-preview",
+  "publisher": "your-publisher",
+  "displayName": "QML Preview",
+  "description": "Preview QML files from CMake Qt targets using qml.exe",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-account/qml-preview.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-account/qml-preview/issues"
+  },
+  "homepage": "https://github.com/your-account/qml-preview#readme",
+  "keywords": [
+    "qml",
+    "qt",
+    "cmake",
+    "preview"
+  ],
+  "files": [
+    "out/**",
+    "src/**",
+    "package.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "workspaceContains:CMakeLists.txt"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "qmlPreview.selectTarget",
+        "title": "QML Preview: Select Target"
+      },
+      {
+        "command": "qmlPreview.preview",
+        "title": "QML Preview: Run Preview"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "qmlPreview.preview",
+        "key": "f7",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "QML Preview",
+      "properties": {
+        "qmlPreview.qmlExecutable": {
+          "type": "string",
+          "default": "C:/Qt/6.10.2/mingw_64/bin/qml.exe",
+          "description": "Path to qml.exe executable"
+        },
+        "qmlPreview.qmlEnv": {
+          "type": "string",
+          "default": "QT_FORCE_STDERR_LOGGING=1 QT_LOGGING_TO_CONSOLE=1 QT_ASSUME_STDERR_HAS_CONSOLE=1",
+          "description": "Environment variable assignments for qml process, e.g. KEY1=VALUE1 KEY2=VALUE2"
+        },
+        "qmlPreview.hotreload": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable hot reload by launching qml through qmlpreview"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.0.0"
+  }
+}
