@@ -1,18 +1,18 @@
 {
   "name": "qml-preview",
-  "publisher": "your-publisher",
+  "publisher": "arkceajin",
   "displayName": "QML Preview",
   "description": "Preview QML files from CMake Qt targets using qml.exe",
   "version": "0.1.0",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-account/qml-preview.git"
+    "url": "https://github.com/arkceajin/qml-preview-extension.git"
   },
   "bugs": {
-    "url": "https://github.com/your-account/qml-preview/issues"
+    "url": "https://github.com/arkceajin/qml-preview-extension/issues"
   },
-  "homepage": "https://github.com/your-account/qml-preview#readme",
+  "homepage": "https://github.com/arkceajin/qml-preview-extension#readme",
   "keywords": [
     "qml",
     "qt",
