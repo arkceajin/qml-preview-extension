@@ -3,194 +3,172 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, ChildProcess } from 'child_process';
 
-interface QtTarget {
-    name: string;
-    qmlFiles: string[];
-}
-
-interface CMakeFile {
-    file: string;
-    dir: string;
-}
-
-function normalizeQmlFileToken(token: string): string {
-    return token.trim().replace(/^"|"$/g, '').replace(/^'|'$/g, '');
-}
-
-function resolveQmlFilePath(token: string, cmakeDir: string): string {
-    const normalized = normalizeQmlFileToken(token)
-        .replace(/\$\{CMAKE_CURRENT_SOURCE_DIR\}/g, cmakeDir)
-        .replace(/\$\{CMAKE_CURRENT_LIST_DIR\}/g, cmakeDir);
-
-    if (path.isAbsolute(normalized)) {
-        return path.normalize(normalized);
-    }
-
-    return path.normalize(path.join(cmakeDir, normalized));
-}
-
-// Recursively gather CMakeLists.txt files following add_subdirectory
-function gatherCMakeFiles(workspaceRoot: string): CMakeFile[] {
-    const result: CMakeFile[] = [];
-    const visited = new Set<string>();
-
-    function visit(dir: string) {
-        if (visited.has(dir)) { return; }
-        visited.add(dir);
-
-        const cmakePath = path.join(dir, 'CMakeLists.txt');
-        if (!fs.existsSync(cmakePath)) { return; }
-
-        result.push({ file: cmakePath, dir });
-
-        const content = fs.readFileSync(cmakePath, 'utf-8');
-        const subdirRegex = /add_subdirectory\s*\(\s*(\S+)/g;
-        let m: RegExpExecArray | null;
-        while ((m = subdirRegex.exec(content)) !== null) {
-            visit(path.join(dir, m[1]));
-        }
-    }
-
-    visit(workspaceRoot);
-    return result;
-}
-
-// Parse all CMakeLists.txt files and return qt_add_executable targets with their QML files
-function parseQtTargets(workspaceRoot: string): QtTarget[] {
-    const cmakeFiles = gatherCMakeFiles(workspaceRoot);
-    const executableTargets = new Set<string>();
-    const qmlModules = new Map<string, string[]>();
-
-    for (const { file, dir } of cmakeFiles) {
-        const content = fs.readFileSync(file, 'utf-8');
-
-        // Find qt_add_executable targets
-        const execRegex = /qt_add_executable\s*\(\s*(\w+)/g;
-        let m: RegExpExecArray | null;
-        while ((m = execRegex.exec(content)) !== null) {
-            executableTargets.add(m[1]);
-        }
-
-        // Find qt_add_qml_module blocks and extract QML_FILES
-        // Match the full parenthesized block (handles multiline)
-        const moduleRegex = /qt_add_qml_module\s*\(([^)]+)\)/gs;
-        while ((m = moduleRegex.exec(content)) !== null) {
-            const block = m[1];
-            const nameMatch = block.match(/^\s*(\w+)/);
-            if (!nameMatch) { continue; }
-            const targetName = nameMatch[1];
-
-            // Extract everything after QML_FILES until the next ALL_CAPS keyword or end
-            const qmlFilesMatch = block.match(/QML_FILES\s+([\s\S]*?)(?=\s+[A-Z][A-Z_]{1,}\s|\s*$)/);
-            if (!qmlFilesMatch) { continue; }
-
-            const files = qmlFilesMatch[1].trim().split(/\s+/).filter(f => f.length > 0);
-            const absPaths = files.map(f => resolveQmlFilePath(f, dir));
-
-            const existing = qmlModules.get(targetName) ?? [];
-            qmlModules.set(targetName, [...existing, ...absPaths]);
-        }
-    }
-
-    return Array.from(executableTargets).map(name => ({
-        name,
-        qmlFiles: qmlModules.get(name) ?? []
-    }));
-}
-
-let selectedTarget: QtTarget | undefined;
-let allTargets: QtTarget[] = [];
-let targetStatusBar: vscode.StatusBarItem;
+let selectedQmlFile: string | undefined; // absolute path
+let qmlFileStatusBar: vscode.StatusBarItem;
 let previewStatusBar: vscode.StatusBarItem;
 let qmlProcess: ChildProcess | undefined;
 let outputChannel: vscode.OutputChannel;
 
 export function activate(context: vscode.ExtensionContext) {
-    // Output channel for QML process output
     outputChannel = vscode.window.createOutputChannel('QML Preview');
     context.subscriptions.push(outputChannel);
 
-    // Status bar: target selector (left side)
-    targetStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 101);
-    targetStatusBar.command = 'qmlPreview.selectTarget';
-    targetStatusBar.tooltip = 'Click to select Qt executable target';
-    context.subscriptions.push(targetStatusBar);
+    qmlFileStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 101);
+    qmlFileStatusBar.command = 'qmlPreview.selectQmlFile';
+    qmlFileStatusBar.tooltip = 'Click to select QML file for preview';
+    context.subscriptions.push(qmlFileStatusBar);
 
-    // Status bar: preview button
     previewStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     previewStatusBar.command = 'qmlPreview.preview';
     previewStatusBar.text = '$(play) Preview';
     previewStatusBar.tooltip = 'Run QML Preview';
     context.subscriptions.push(previewStatusBar);
 
-    // Command: select target
     context.subscriptions.push(
-        vscode.commands.registerCommand('qmlPreview.selectTarget', async () => {
-            refreshTargets();
-
-            if (allTargets.length === 0) {
-                vscode.window.showWarningMessage('No qt_add_executable targets found in CMakeLists.txt');
-                return;
-            }
-
-            const items = allTargets.map(t => ({
-                label: t.name,
-                description: t.qmlFiles.length > 0
-                    ? t.qmlFiles.map(f => path.basename(f)).join(', ')
-                    : '(no QML files)'
-            }));
-
-            const picked = await vscode.window.showQuickPick(items, {
-                placeHolder: 'Select Qt executable target for QML Preview'
-            });
-
+        vscode.commands.registerCommand('qmlPreview.selectQmlFile', async () => {
+            const picked = await pickQmlFile();
             if (picked) {
-                selectedTarget = allTargets.find(t => t.name === picked.label);
+                selectedQmlFile = picked;
                 updateStatusBar();
             }
         })
     );
 
-    // Command: run preview
     context.subscriptions.push(
         vscode.commands.registerCommand('qmlPreview.preview', async () => {
             await runPreview();
         })
     );
 
-    // Initial parse
-    refreshTargets();
+    initSelectedQmlFile();
     updateStatusBar();
-
-    // Watch CMakeLists.txt changes
-    const watcher = vscode.workspace.createFileSystemWatcher('**/CMakeLists.txt');
-    watcher.onDidChange(() => { refreshTargets(); updateStatusBar(); });
-    watcher.onDidCreate(() => { refreshTargets(); updateStatusBar(); });
-    context.subscriptions.push(watcher);
 }
 
-function refreshTargets() {
+function getConfiguredQmlFile(): string {
+    const config = vscode.workspace.getConfiguration('qmlPreview');
+    return (config.get<string>('previewQmlFile') ?? '').trim();
+}
+
+async function initSelectedQmlFile(): Promise<void> {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) { return; }
+    const workspaceRoot = folders[0].uri.fsPath;
 
-    allTargets = parseQtTargets(folders[0].uri.fsPath);
-
-    if (!selectedTarget && allTargets.length > 0) {
-        selectedTarget = allTargets[0];
-    } else if (selectedTarget) {
-        selectedTarget = allTargets.find(t => t.name === selectedTarget!.name) ?? allTargets[0];
+    const configured = getConfiguredQmlFile();
+    if (configured) {
+        const absPath = path.resolve(workspaceRoot, configured);
+        if (fs.existsSync(absPath)) {
+            selectedQmlFile = absPath;
+            updateStatusBar();
+            return;
+        }
     }
+
+    // Default: find Main.qml
+    const uris = await vscode.workspace.findFiles('**/*.qml', '{**/node_modules/**,**/build/**}', 200);
+    const mainQml = uris.find(u => path.basename(u.fsPath).toLowerCase() === 'main.qml');
+    if (mainQml) {
+        selectedQmlFile = mainQml.fsPath;
+        updateStatusBar();
+    }
+}
+
+async function pickQmlFile(): Promise<string | undefined> {
+    const folders = vscode.workspace.workspaceFolders;
+    const workspaceRoot = folders?.[0].uri.fsPath ?? '';
+
+    const uris = await vscode.workspace.findFiles('**/*.qml', '{**/node_modules/**,**/build/**}', 500);
+
+    if (uris.length === 0) {
+        vscode.window.showWarningMessage('No QML files found in workspace.');
+        return undefined;
+    }
+
+    const items = uris.map(u => {
+        const rel = path.relative(workspaceRoot, u.fsPath).replace(/\\/g, '/');
+        return { label: path.basename(u.fsPath), description: rel, fsPath: u.fsPath };
+    }).sort((a, b) => {
+        const aIsMain = a.label.toLowerCase() === 'main.qml';
+        const bIsMain = b.label.toLowerCase() === 'main.qml';
+        if (aIsMain && !bIsMain) { return -1; }
+        if (!aIsMain && bIsMain) { return 1; }
+        return a.description.localeCompare(b.description);
+    });
+
+    const picked = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select QML file for preview'
+    });
+
+    return picked?.fsPath;
 }
 
 function updateStatusBar() {
-    if (allTargets.length === 0) {
-        targetStatusBar.text = '$(list-selection) No Qt targets';
-        previewStatusBar.hide();
+    const folders = vscode.workspace.workspaceFolders;
+    const workspaceRoot = folders?.[0].uri.fsPath ?? '';
+
+    if (selectedQmlFile) {
+        const rel = path.relative(workspaceRoot, selectedQmlFile).replace(/\\/g, '/');
+        qmlFileStatusBar.text = `$(file-code) ${rel}`;
     } else {
-        targetStatusBar.text = `$(list-selection) ${selectedTarget?.name ?? 'Select target'}`;
-        previewStatusBar.show();
+        qmlFileStatusBar.text = '$(file-code) Select QML file';
     }
-    targetStatusBar.show();
+    qmlFileStatusBar.show();
+    previewStatusBar.show();
+}
+
+function findLatestQtKitInRoot(installRoot: string): string | null {
+    try {
+        const versionDirs = fs.readdirSync(installRoot)
+            .filter(d => /^\d+\.\d+/.test(d))
+            .sort((a, b) => {
+                const av = a.split('.').map(Number);
+                const bv = b.split('.').map(Number);
+                for (let i = 0; i < Math.max(av.length, bv.length); i++) {
+                    if ((bv[i] ?? 0) !== (av[i] ?? 0)) { return (bv[i] ?? 0) - (av[i] ?? 0); }
+                }
+                return 0;
+            });
+
+        const qmlBin = process.platform === 'win32' ? 'qml.exe' : 'qml';
+        for (const ver of versionDirs) {
+            const verPath = path.join(installRoot, ver);
+            const kitDirs = fs.readdirSync(verPath).filter(d =>
+                fs.existsSync(path.join(verPath, d, 'bin', qmlBin))
+            );
+            if (kitDirs.length > 0) {
+                const preferred = kitDirs.find(d => d.includes('64')) ?? kitDirs[0];
+                const result = path.join(verPath, preferred);
+                outputChannel.appendLine(`[QML Preview] Qt extension: found kit ${result}`);
+                return result;
+            }
+        }
+    } catch (err) {
+        outputChannel.appendLine(`[QML Preview] Error scanning Qt installation root: ${err}`);
+    }
+    return null;
+}
+
+async function extractQtPathFromQtExtension(): Promise<string | null> {
+    const config = vscode.workspace.getConfiguration('qt-core');
+
+    // additionalQtPaths: array of paths to qmake/qtpaths executables
+    const additionalPaths = config.get<string[]>('additionalQtPaths') ?? [];
+    for (const p of additionalPaths) {
+        if (!p) { continue; }
+        const binDir = path.dirname(p);
+        const qtRoot = path.dirname(binDir); // strip bin/
+        outputChannel.appendLine(`[QML Preview] Qt extension additionalQtPaths -> ${qtRoot}`);
+        return qtRoot;
+    }
+
+    // qtInstallationRoot: e.g. C:/Qt — scan for latest version + kit
+    const installRoot = (config.get<string>('qtInstallationRoot') ?? '').trim();
+    if (installRoot && fs.existsSync(installRoot)) {
+        outputChannel.appendLine(`[QML Preview] Qt extension qtInstallationRoot: ${installRoot}`);
+        return findLatestQtKitInRoot(installRoot);
+    }
+
+    return null;
 }
 
 async function extractQtPathFromCMakeCache(): Promise<string | null> {
@@ -209,13 +187,11 @@ async function extractQtPathFromCMakeCache(): Promise<string | null> {
         const content = fs.readFileSync(cacheFile, 'utf-8');
         const lines = content.split('\n');
 
-        // Try to find Qt6_DIR first
         for (const line of lines) {
             if (line.startsWith('Qt6_DIR:PATH=') || line.startsWith('Qt6_DIR:STRING=')) {
                 let qtPath = line.split('=')[1].trim();
                 if (qtPath) {
                     outputChannel.appendLine(`[QML Preview] Found Qt6_DIR: ${qtPath}`);
-                    // Qt6_DIR points to lib/cmake/Qt6, we need to go up to the Qt root
                     qtPath = qtPath.replace(/\\/g, '/');
                     if (qtPath.endsWith('/lib/cmake/Qt6')) {
                         qtPath = qtPath.substring(0, qtPath.length - '/lib/cmake/Qt6'.length);
@@ -226,13 +202,11 @@ async function extractQtPathFromCMakeCache(): Promise<string | null> {
             }
         }
 
-        // Try Qt5_DIR
         for (const line of lines) {
             if (line.startsWith('Qt5_DIR:PATH=') || line.startsWith('Qt5_DIR:STRING=')) {
                 let qtPath = line.split('=')[1].trim();
                 if (qtPath) {
                     outputChannel.appendLine(`[QML Preview] Found Qt5_DIR: ${qtPath}`);
-                    // Qt5_DIR also points to lib/cmake/Qt5
                     qtPath = qtPath.replace(/\\/g, '/');
                     if (qtPath.endsWith('/lib/cmake/Qt5')) {
                         qtPath = qtPath.substring(0, qtPath.length - '/lib/cmake/Qt5'.length);
@@ -243,7 +217,6 @@ async function extractQtPathFromCMakeCache(): Promise<string | null> {
             }
         }
 
-        // Try CMAKE_PREFIX_PATH
         for (const line of lines) {
             if (line.startsWith('CMAKE_PREFIX_PATH:PATH=')) {
                 const paths = line.split('=')[1].trim().split(';');
@@ -263,32 +236,9 @@ async function extractQtPathFromCMakeCache(): Promise<string | null> {
     return null;
 }
 
-async function extractQtPathFromExtensions(): Promise<string | null> {
-    try {
-        // Try CMake Tools Extension
-        const cmakeExt = vscode.extensions.getExtension('ms-vscode.cmake-tools');
-        if (cmakeExt && cmakeExt.isActive) {
-            outputChannel.appendLine(`[QML Preview] CMake Tools extension found and active`);
-            // Try to access CMake Tools API if available
-            if (cmakeExt.exports && typeof cmakeExt.exports.getActiveKitName === 'function') {
-                try {
-                    const kitName = await cmakeExt.exports.getActiveKitName();
-                    outputChannel.appendLine(`[QML Preview] Active CMake kit: ${kitName}`);
-                } catch (e) {
-                    // API might not be available
-                }
-            }
-        }
-    } catch (err) {
-        outputChannel.appendLine(`[QML Preview] Error accessing CMake Extension: ${err}`);
-    }
-
-    return null;
-}
-
 function getQmlExecutable(): string {
     const config = vscode.workspace.getConfiguration('qmlPreview');
-    return config.get<string>('qmlExecutable') ?? 'C:/Qt/6.10.2/mingw_64/bin/qml.exe';
+    return (config.get<string>('qmlExecutable') ?? '').trim();
 }
 
 function getHotReloadEnabled(): boolean {
@@ -318,17 +268,6 @@ function getConfiguredQmlEnv(): NodeJS.ProcessEnv {
     const configured = config.get<string>('qmlEnv')
         ?? 'QT_FORCE_STDERR_LOGGING=1 QT_LOGGING_TO_CONSOLE=1 QT_ASSUME_STDERR_HAS_CONSOLE=1';
     return parseEnvAssignments(configured);
-}
-
-function selectEntryQml(target: QtTarget): string | null {
-    if (target.qmlFiles.length === 0) {
-        return null;
-    }
-
-    const mainQml = target.qmlFiles.find(
-        f => path.basename(normalizeQmlFileToken(f)).toLowerCase() === 'main.qml'
-    );
-    return mainQml ?? target.qmlFiles[0];
 }
 
 function prependEnvList(
@@ -364,15 +303,34 @@ function collectExistingDirs(dirs: string[]): string[] {
 }
 
 async function runPreview() {
-    if (!selectedTarget) {
-        vscode.window.showWarningMessage('No QML target selected. Click the target selector first.');
-        return;
-    }
-
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) {
         vscode.window.showWarningMessage('No workspace folder found.');
         return;
+    }
+    const workspaceRoot = folders[0].uri.fsPath;
+
+    // Resolve from config if not yet selected
+    if (!selectedQmlFile) {
+        const configured = getConfiguredQmlFile();
+        if (configured) {
+            const absPath = path.resolve(workspaceRoot, configured);
+            if (fs.existsSync(absPath)) {
+                selectedQmlFile = absPath;
+                updateStatusBar();
+            }
+        }
+    }
+
+    // Prompt user if still unset
+    if (!selectedQmlFile) {
+        const picked = await pickQmlFile();
+        if (!picked) {
+            vscode.window.showWarningMessage('No QML file selected for preview.');
+            return;
+        }
+        selectedQmlFile = picked;
+        updateStatusBar();
     }
 
     // Kill previous process if still running
@@ -381,38 +339,38 @@ async function runPreview() {
         qmlProcess = undefined;
     }
 
-    // Clear previous output
     outputChannel.clear();
     outputChannel.show();
     outputChannel.appendLine(`[QML Preview] Searching for Qt path...`);
 
-    // Try to get Qt path from CMakeCache.txt
-    const qtPath = await extractQtPathFromCMakeCache();
-    
-    let qmlExe = getQmlExecutable();
+    const qtPath = await extractQtPathFromCMakeCache()
+        ?? await extractQtPathFromQtExtension();
+
+    const qmlBin = process.platform === 'win32' ? 'qml.exe' : 'qml';
+    let qmlExe: string;
     if (qtPath) {
-        qmlExe = path.join(qtPath, 'bin', process.platform === 'win32' ? 'qml.exe' : 'qml');
+        qmlExe = path.join(qtPath, 'bin', qmlBin);
+        outputChannel.appendLine(`[QML Preview] Resolved qml executable: ${qmlExe}`);
+    } else {
+        qmlExe = getQmlExecutable();
+        if (!qmlExe) {
+            vscode.window.showErrorMessage(
+                'Cannot find qml executable. Set qt-core.qtInstallationRoot in Qt extension settings, or set qmlPreview.qmlExecutable manually.'
+            );
+            return;
+        }
+        outputChannel.appendLine(`[QML Preview] Using configured qml executable: ${qmlExe}`);
     }
 
-    const workspaceRoot = folders[0].uri.fsPath;
-    outputChannel.appendLine(`[QML Preview] Target QML files: ${selectedTarget.qmlFiles.join(', ')}`);
-    const entryQmlAbs = selectEntryQml(selectedTarget);
-    if (!entryQmlAbs) {
-        vscode.window.showWarningMessage(
-            `Target "${selectedTarget.name}" has no QML files defined in qt_add_qml_module.`
-        );
-        return;
-    }
-
-    let qmlEntry = path.relative(workspaceRoot, entryQmlAbs);
+    // Always pass the full workspace-relative path (e.g. ui/Main.qml, not just Main.qml)
+    let qmlEntry = path.relative(workspaceRoot, selectedQmlFile).replace(/\\/g, '/');
     if (!qmlEntry || qmlEntry.startsWith('..')) {
-        qmlEntry = path.basename(entryQmlAbs);
+        qmlEntry = path.basename(selectedQmlFile);
         outputChannel.appendLine(
-            `[QML Preview] Entry QML is outside workspace root, fallback to file name: ${qmlEntry}`
+            `[QML Preview] QML file is outside workspace root, using filename: ${qmlEntry}`
         );
     }
 
-    qmlEntry = qmlEntry.replace(/\\/g, '/');
     const buildDirName = 'build';
     const qmlArgs = ['-I', buildDirName, qmlEntry];
     const hotreload = getHotReloadEnabled();
@@ -420,7 +378,10 @@ async function runPreview() {
     let launchArgs = [...qmlArgs];
 
     if (hotreload) {
-        const previewExe = path.join(path.dirname(qmlExe), process.platform === 'win32' ? 'qmlpreview.exe' : 'qmlpreview');
+        const previewExe = path.join(
+            path.dirname(qmlExe),
+            process.platform === 'win32' ? 'qmlpreview.exe' : 'qmlpreview'
+        );
         launchExe = previewExe;
         launchArgs = [qmlExe, ...qmlArgs];
     }
@@ -430,21 +391,17 @@ async function runPreview() {
         : value;
     const fullCommand = [launchExe, ...launchArgs].map(quoteArg).join(' ');
 
+    outputChannel.appendLine(`[QML Preview] QML file: ${selectedQmlFile}`);
     outputChannel.appendLine(`[QML Preview] Starting: ${qmlExe}`);
     outputChannel.appendLine(`[QML Preview] Args: ${qmlArgs.join(' ')}`);
-    outputChannel.appendLine(`[QML Preview] Selected entry: ${qmlEntry}`);
+    outputChannel.appendLine(`[QML Preview] Entry: ${qmlEntry}`);
     outputChannel.appendLine(`[QML Preview] Hot reload: ${hotreload ? 'on' : 'off'}`);
     outputChannel.appendLine(`[QML Preview] Full command: ${fullCommand}`);
     outputChannel.appendLine('---');
-
     outputChannel.appendLine(`[QML Preview] Working directory: ${workspaceRoot}`);
-    outputChannel.appendLine(`[QML Preview] Exec: (cd ${workspaceRoot}) && ${fullCommand}`);
 
     const configuredQmlEnv = getConfiguredQmlEnv();
-    const childEnv: NodeJS.ProcessEnv = {
-        ...process.env,
-        ...configuredQmlEnv
-    };
+    const childEnv: NodeJS.ProcessEnv = { ...process.env, ...configuredQmlEnv };
 
     const buildDir = path.join(workspaceRoot, 'build');
     const runtimeDirs = collectExistingDirs([
@@ -523,10 +480,7 @@ async function runPreview() {
         outputChannel.appendLine(`[QML Preview] Process exited with code ${code}, signal ${signal}`);
     });
 
-    vscode.window.setStatusBarMessage(
-        `$(play) QML Preview: ${selectedTarget.name}`,
-        4000
-    );
+    vscode.window.setStatusBarMessage(`$(play) QML Preview: ${qmlEntry}`, 4000);
 }
 
 export function deactivate() {

@@ -2,8 +2,8 @@
   "name": "qml-preview",
   "publisher": "arkceajin",
   "displayName": "QML Preview",
-  "description": "Preview QML files from CMake Qt targets using qml.exe",
-  "version": "0.1.0",
+  "description": "Preview QML files using qml.exe",
+  "version": "0.2.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -32,14 +32,14 @@
   },
   "categories": ["Other"],
   "activationEvents": [
-    "workspaceContains:CMakeLists.txt"
+    "workspaceContains:**/*.qml"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "qmlPreview.selectTarget",
-        "title": "QML Preview: Select Target"
+        "command": "qmlPreview.selectQmlFile",
+        "title": "QML Preview: Select QML File"
       },
       {
         "command": "qmlPreview.preview",
@@ -56,10 +56,15 @@
     "configuration": {
       "title": "QML Preview",
       "properties": {
+        "qmlPreview.previewQmlFile": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace-relative path to the QML file to preview (e.g. ui/Main.qml). Leave empty to pick manually or auto-detect Main.qml."
+        },
         "qmlPreview.qmlExecutable": {
           "type": "string",
-          "default": "C:/Qt/6.10.2/mingw_64/bin/qml.exe",
-          "description": "Path to qml.exe executable"
+          "default": "",
+          "description": "Fallback path to qml.exe. Leave empty to auto-detect from Qt extension or CMakeCache."
         },
         "qmlPreview.qmlEnv": {
           "type": "string",
