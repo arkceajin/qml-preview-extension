@@ -171,12 +171,28 @@ async function extractQtPathFromQtExtension(): Promise<string | null> {
     return null;
 }
 
+function resolveBuildDirectory(workspaceRoot: string): string {
+    const cmakeBuildDir = (vscode.workspace.getConfiguration('cmake').get<string>('buildDirectory') ?? '').trim();
+    if (cmakeBuildDir) {
+        const resolved = cmakeBuildDir.replace(/\$\{workspaceFolder\}/gi, workspaceRoot);
+        if (!resolved.includes('${') && fs.existsSync(resolved)) {
+            outputChannel.appendLine(`[QML Preview] CMake build directory (from cmake.buildDirectory): ${resolved}`);
+            return resolved;
+        }
+        if (resolved.includes('${')) {
+            outputChannel.appendLine(`[QML Preview] cmake.buildDirectory has unresolved variables: ${resolved}, falling back to 'build'`);
+        }
+    }
+    return path.join(workspaceRoot, 'build');
+}
+
 async function extractQtPathFromCMakeCache(): Promise<string | null> {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) { return null; }
 
     const workspaceRoot = folders[0].uri.fsPath;
-    const cacheFile = path.join(workspaceRoot, 'build', 'CMakeCache.txt');
+    const buildDir = resolveBuildDirectory(workspaceRoot);
+    const cacheFile = path.join(buildDir, 'CMakeCache.txt');
 
     if (!fs.existsSync(cacheFile)) {
         outputChannel.appendLine(`[QML Preview] CMakeCache.txt not found at ${cacheFile}`);
@@ -244,6 +260,11 @@ function getQmlExecutable(): string {
 function getHotReloadEnabled(): boolean {
     const config = vscode.workspace.getConfiguration('qmlPreview');
     return config.get<boolean>('hotreload') ?? false;
+}
+
+function getAdditionalImportPaths(): string[] {
+    const config = vscode.workspace.getConfiguration('qmlPreview');
+    return config.get<string[]>('additionalImportPaths') ?? [];
 }
 
 function parseEnvAssignments(input: string): NodeJS.ProcessEnv {
@@ -371,8 +392,12 @@ async function runPreview() {
         );
     }
 
-    const buildDirName = 'build';
-    const qmlArgs = ['-I', buildDirName, qmlEntry];
+    const buildDir = resolveBuildDirectory(workspaceRoot);
+    const extraImportPaths = getAdditionalImportPaths().map(p =>
+        path.isAbsolute(p) ? p : path.join(workspaceRoot, p)
+    );
+    const importArgs = [buildDir, ...extraImportPaths].flatMap(p => ['-I', p]);
+    const qmlArgs = [...importArgs, qmlEntry];
     const hotreload = getHotReloadEnabled();
     let launchExe = qmlExe;
     let launchArgs = [...qmlArgs];
@@ -403,7 +428,6 @@ async function runPreview() {
     const configuredQmlEnv = getConfiguredQmlEnv();
     const childEnv: NodeJS.ProcessEnv = { ...process.env, ...configuredQmlEnv };
 
-    const buildDir = path.join(workspaceRoot, 'build');
     const runtimeDirs = collectExistingDirs([
         buildDir,
         path.join(buildDir, 'bin'),
